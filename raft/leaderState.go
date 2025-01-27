@@ -5,7 +5,7 @@ var _ NodeState = (*LeaderState)(nil)
 type LeaderState struct{}
 
 func (l *LeaderState) HandleHeartbeat(node *Node) {
-	for _, peer := range node.Peers {
+	for _, peer := range node.GetPeers() {
 		go node.SendHeartbeat(peer)
 	}
 }
