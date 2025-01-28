@@ -7,6 +7,7 @@ option go_package = "github.com/Zhima-Mochi/raft-kv-store/proto";
 service Raft {
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 // AppendEntries RPC
@@ -41,4 +42,12 @@ message LogEntry {
   int32 index = 1;
   int32 term = 2;
   string command = 3;
+}
+
+message HeartbeatRequest {
+  int32 term = 1;
+}
+
+message HeartbeatResponse {
+  int32 term = 1;
 }

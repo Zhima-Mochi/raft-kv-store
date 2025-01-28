@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -8,45 +9,58 @@ import (
 )
 
 type Node struct {
-	ID             uuid.UUID
+	id             uuid.UUID
 	address        string
 	port           int
-	state          NodeState
-	currentTerm    int
-	votedFor       *uuid.UUID
-	votesReceived  int
+	isLeader       bool
+	state          State
+	election       Election
+	currentTerm    int32
+	votedFor       *Peer
+	votesReceived  int32
 	peers          []*Peer
-	mutex          sync.Mutex
-	electionTimer  *time.Timer
+	mutex          sync.RWMutex
 	heartbeatTimer *time.Timer
 }
 
-func NewNode(address string, port int) *Node {
-	id := uuid.New()
-
-	return &Node{
-		ID:      id,
+func CreateNode(id uuid.UUID, address string, port int) *Node {
+	node := &Node{
+		id:      id,
 		address: address,
 		port:    port,
-		state:   &FollowerState{},
 	}
+	return node
 }
 
-func (n *Node) GetState() NodeState {
-	return n.state
+func (n *Node) GetID() uuid.UUID {
+	return n.id
 }
 
-func (n *Node) SetState(state NodeState) {
+func (n *Node) GetAddress() string {
+	return n.address
+}
+
+func (n *Node) GetPort() int {
+	return n.port
+}
+
+func (n *Node) SetState(state State) {
+	n.state = state
+	go n.state.HandleHeartbeat()
+}
+
+// GetCurrentTerm returns the current term
+func (n *Node) GetCurrentTerm() int32 {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
+	return n.currentTerm
+}
+
+// SetCurrentTerm updates the current term
+func (n *Node) SetCurrentTerm(term int32) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	n.state = state
-}
-func (n *Node) SendHeartbeat(peer *Peer) {
-	panic("not implemented")
-}
-
-func (n *Node) ResetElectionTimeout() {
-	panic("not implemented")
+	n.currentTerm = term
 }
 
 func (n *Node) AddPeer(peer *Peer) {
@@ -57,4 +71,16 @@ func (n *Node) AddPeer(peer *Peer) {
 
 func (n *Node) GetPeers() []*Peer {
 	return n.peers
+}
+
+func (n *Node) Run() error {
+	if n.state == nil {
+		return fmt.Errorf("state is nil")
+	}
+	go n.state.HandleHeartbeat()
+	return nil
+}
+
+func (n *Node) HeartbeatTimer() *time.Timer {
+	return n.heartbeatTimer
 }

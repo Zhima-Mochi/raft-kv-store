@@ -8,7 +8,7 @@ import (
 )
 
 type Peer struct {
-	ID      uuid.UUID
+	id      uuid.UUID
 	address string
 	port    int
 	conn    *grpc.ClientConn
@@ -17,7 +17,7 @@ type Peer struct {
 
 func NewPeer(id uuid.UUID, address string, port int) *Peer {
 	return &Peer{
-		ID:      id,
+		id:      id,
 		address: address,
 		port:    port,
 	}
@@ -25,4 +25,8 @@ func NewPeer(id uuid.UUID, address string, port int) *Peer {
 
 func (p *Peer) GetAddress() string {
 	return fmt.Sprintf("%s:%d", p.address, p.port)
+}
+
+func (p *Peer) SendHeartbeat() {
+
 }
