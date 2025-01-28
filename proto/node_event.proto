@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package node;
+
+option go_package = "github.com/Zhima-Mochi/raft-kv-store/node";
+
+import "google/protobuf/any.proto";
+
+// Define Empty message
+message Empty {}
+
+// Define EventType enum
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_HEARTBEAT = 1;
+  EVENT_TYPE_VOTE_REQUEST = 2;
+  EVENT_TYPE_VOTE_RESPONSE = 3;
+}
+
+// Define UUID message since protobuf doesn't have a native UUID type
+message UUID {
+  string value = 1;
+}
+
+service Node {
+  rpc SendEvent(Event) returns (Empty);
+}
+
+message Event {
+  EventType type = 1;
+  UUID from = 2;
+  uint64 term = 3;
+  google.protobuf.Any data = 4;
+}
+
