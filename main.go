@@ -17,14 +17,17 @@ func main() {
 	for i := 0; i < 3; i++ {
 		for j := 0; j < 3; j++ {
 			if i != j {
-				nodes[i].AddPeer(node.NewPeer(nodes[j]))
+				nodes[i].AddPeer(node.NewPeer(nodes[j].GetID(), nodes[j].GetAddress(), nodes[j].GetPort()))
 			}
 		}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	for _, n := range nodes {
-		go n.Run(context.Background())
+		go n.Run(ctx)
 	}
 
-	select {}
+	<-ctx.Done()
 }

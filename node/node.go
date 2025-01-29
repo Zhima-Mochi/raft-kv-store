@@ -2,222 +2,186 @@ package node
 
 import (
 	"context"
-	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"google.golang.org/protobuf/types/known/anypb"
-)
-
-type Role int32
-
-const (
-	FollowerRole  Role = 0
-	CandidateRole Role = 1
-	LeaderRole    Role = 2
-)
-
-const (
-	HeartbeatInterval = 10 * time.Second
-	ElectTimeout      = 10 * time.Second
 )
 
 type Node struct {
-	id      uuid.UUID
-	address string
-	port    int
+	id uuid.UUID
+	es EventService
 
-	role Role
-
-	peers    map[uuid.UUID]*Peer
-	leaderID uuid.UUID
-
-	eventChan   chan *Event
-	voteTo      uuid.UUID
-	earnedVotes uint32
+	// Protects term, voteTo, leaderID, earnedVotes
+	termMutex sync.RWMutex
 
 	currentTerm uint64
+	voteTo      uuid.UUID
+	leaderID    uuid.UUID
 
+	// earnedVotes is used with atomic operations
+	earnedVotes uint32
+
+	// The node's current state (Follower/Candidate/Leader)
+	state      RoleState
+	stateMutex sync.RWMutex
+
+	// Context management for the current RoleState
+	roleCtx    context.Context
+	roleCancel context.CancelFunc
+
+	// Holds references to other cluster members
+	peers     map[uuid.UUID]*Peer
 	peerMutex sync.RWMutex
+
+	// Channel for receiving events
+	eventChan chan *Event
 }
 
-func New(id uuid.UUID, address string, port int) *Node {
+// New creates a new Node with some default values.
+func New(id uuid.UUID, es EventService) *Node {
 	node := &Node{
 		id:        id,
-		address:   address,
-		port:      port,
-		role:      FollowerRole,
+		es:        es,
+		voteTo:    uuid.Nil,
 		peers:     make(map[uuid.UUID]*Peer),
 		eventChan: make(chan *Event, 1024),
 	}
 	return node
 }
 
-func (n *Node) GetID() uuid.UUID {
-	return n.id
+// Run starts this Node as a Follower by default, then listens for incoming events.
+func (n *Node) Run(ctx context.Context) {
+	// Start in Follower state (leaderID = uuid.Nil initially)
+	n.setState(ctx, NewFollowerState(n, uuid.Nil))
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Cancel current state’s context
+			if n.roleCancel != nil {
+				n.roleCancel()
+			}
+			return
+		case event := <-n.eventChan:
+			// Delegate event handling to current state
+			st := n.getCurrentState()
+			if st != nil {
+				if err := st.handleEvent(n.roleCtx, event); err != nil {
+					log.Printf("[Node %s] Error handling event: %v", n.id.String(), err)
+				}
+			}
+		}
+	}
 }
 
+// updateTermAndStepDown atomically checks and steps down to a new term if eventTerm is larger.
+func (n *Node) updateTermAndStepDown(ctx context.Context, eventTerm uint64, leaderID uuid.UUID) bool {
+	n.termMutex.Lock()
+	defer n.termMutex.Unlock()
+
+	if eventTerm > n.currentTerm {
+		n.currentTerm = eventTerm
+		n.voteTo = uuid.Nil
+		n.leaderID = leaderID
+		// Step down to Follower
+		n.setState(ctx, NewFollowerState(n, leaderID))
+		return true
+	}
+	return false
+}
+
+// getCurrentState safely gets the current RoleState (Follower/Candidate/Leader)
+func (n *Node) getCurrentState() RoleState {
+	n.stateMutex.RLock()
+	defer n.stateMutex.RUnlock()
+	return n.state
+}
+
+// setState transitions the node to a new RoleState.
+func (n *Node) setState(ctx context.Context, newState RoleState) {
+	// Cancel old state context if exists
+	if n.roleCancel != nil {
+		n.roleCancel()
+	}
+
+	// Create a new context for the new state
+	ctx, cancel := context.WithCancel(ctx)
+
+	n.stateMutex.Lock()
+	oldState := n.state
+	n.state = newState
+	n.roleCtx = ctx
+	n.roleCancel = cancel
+	n.stateMutex.Unlock()
+
+	if oldState != nil {
+		oldState.onExit()
+	}
+
+	// Log the role transition
+	n.termMutex.RLock()
+	currentTerm := n.currentTerm
+	n.termMutex.RUnlock()
+
+	log.Printf("[Node %s] Transitioning from %s to %s for term %d",
+		n.id.String(),
+		roleString(oldState),
+		roleString(newState),
+		currentTerm,
+	)
+
+	// Start the new state's run loop
+	go newState.run(ctx)
+}
+
+// resetEarnedVotes atomically resets the earned votes to 0.
+func (n *Node) resetEarnedVotes() {
+	atomic.StoreUint32(&n.earnedVotes, 0)
+}
+
+// incrementEarnedVotes atomically increments the earned votes by 1.
+func (n *Node) incrementEarnedVotes() {
+	atomic.AddUint32(&n.earnedVotes, 1)
+}
+
+// getEarnedVotes safely gets the current number of earned votes.
+func (n *Node) getEarnedVotes() uint32 {
+	return atomic.LoadUint32(&n.earnedVotes)
+}
+
+// AddPeer safely adds a new peer to the node's peer map.
 func (n *Node) AddPeer(peer *Peer) {
 	n.peerMutex.Lock()
 	defer n.peerMutex.Unlock()
 	n.peers[peer.id] = peer
 }
 
+// RemovePeer safely remove a peer from the node's peer map.
 func (n *Node) RemovePeer(peer *Peer) {
 	n.peerMutex.Lock()
 	defer n.peerMutex.Unlock()
 	delete(n.peers, peer.id)
 }
 
+// GetPeers safely gets a snapshot of the node's peer map.
 func (n *Node) GetPeers() map[uuid.UUID]*Peer {
 	n.peerMutex.RLock()
 	defer n.peerMutex.RUnlock()
-	return n.peers
+	// Return a shallow copy if we want to avoid concurrency issues
+	snap := make(map[uuid.UUID]*Peer)
+	for k, v := range n.peers {
+		snap[k] = v
+	}
+	return snap
 }
 
-func (n *Node) toCandidate() error {
-	if n.role == CandidateRole {
-		return nil
-	}
-	n.role = CandidateRole
-	n.voteTo = uuid.Nil
-	n.currentTerm++
-	n.earnedVotes = 0
-	log.Printf("[Node %s] Becoming candidate for term %d", n.id.String(), n.currentTerm)
-	return nil
-}
-
-func (n *Node) toFollower(leaderID uuid.UUID) error {
-	if n.role != CandidateRole {
-		return errors.New("not a candidate")
-	}
-	n.role = FollowerRole
-	n.leaderID = leaderID
-	log.Printf("[Node %s] Becoming follower, leader is %s", n.id.String(), leaderID.String())
-	return nil
-}
-
-func (n *Node) toLeader() error {
-	if n.role != CandidateRole {
-		return errors.New("not a candidate")
-	}
-	n.role = LeaderRole
-	n.leaderID = n.id
-	log.Printf("[Node %s] Becoming leader for term %d", n.id.String(), n.currentTerm)
-	return nil
-}
-
-func (n *Node) keepAlive(ctx context.Context) {
-	log.Printf("[Node %s] Starting keepAlive loop", n.id.String())
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if n.role == LeaderRole {
-				log.Printf("[Node %s] Sending heartbeat to peers as leader", n.id.String())
-				n.peerMutex.RLock()
-				for _, peer := range n.peers {
-					go func(peer *Peer) {
-						ctx, cancel := context.WithTimeout(ctx, HeartbeatInterval)
-						defer cancel()
-						peer.SendEvent(ctx, &Event{
-							Type: EventType_EVENT_TYPE_HEARTBEAT,
-							From: &UUID{Value: n.id.String()},
-							Data: nil,
-						})
-					}(peer)
-				}
-				n.peerMutex.RUnlock()
-			}
-		}
-	}
-}
-
-func (n *Node) Run(ctx context.Context) {
-	go n.keepAlive(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event := <-n.eventChan:
-			log.Printf("[Node %s] Received event type %s", n.id.String(), event.GetType())
-			if err := n.handleEvent(ctx, event); err != nil {
-				log.Printf("Failed to handle event: %v", err)
-			}
-		}
-	}
-}
-
-func (n *Node) handleEvent(ctx context.Context, event *Event) error {
-	fromUUID, err := uuid.Parse(event.From.Value)
-	if err != nil {
-		return err
-	}
-
-	if event.Term > n.currentTerm {
-		log.Printf("[Node %s] Updating term from %d to %d", n.id.String(), n.currentTerm, event.Term)
-		n.currentTerm = event.Term
-		n.toFollower(fromUUID)
-	} else if event.Term < n.currentTerm {
-		return nil
-	}
-
-	switch event.GetType() {
-	case EventType_EVENT_TYPE_HEARTBEAT:
-		peer, ok := n.peers[fromUUID]
-		if !ok {
-			return errors.New("received heartbeat from unknown peer")
-		}
-
-		if n.leaderID == fromUUID {
-			peer.lastHeartbeat = time.Now()
-			log.Printf("[Node %s] Received valid heartbeat from leader %s", n.id.String(), fromUUID.String())
-
-			if n.role != FollowerRole {
-				n.toFollower(fromUUID)
-			}
-		}
-	case EventType_EVENT_TYPE_VOTE_REQUEST:
-		peer, ok := n.peers[fromUUID]
-		if !ok {
-			return errors.New("received vote request from unknown peer")
-		}
-
-		if n.role == FollowerRole && n.voteTo == uuid.Nil {
-			log.Printf("[Node %s] Sending vote to %s", n.id.String(), fromUUID.String())
-			vote := &Vote{VoteTo: n.id}
-			b, err := vote.Serialize()
-			if err != nil {
-				return err
-			}
-			peer.SendEvent(ctx, &Event{
-				Type: EventType_EVENT_TYPE_VOTE_RESPONSE,
-				From: &UUID{Value: n.id.String()},
-				Data: &anypb.Any{Value: b},
-			})
-		}
-	case EventType_EVENT_TYPE_VOTE_RESPONSE:
-		if n.role != CandidateRole {
-			return nil
-		}
-
-		var vote *Vote
-		if vote, err = vote.Deserialize(event.Data.Value); err != nil {
-			return err
-		}
-		if vote.VoteTo == n.id {
-			n.earnedVotes++
-			log.Printf("[Node %s] Received vote from %s (votes: %d/%d)",
-				n.id.String(), fromUUID.String(), n.earnedVotes, len(n.peers)/2+1)
-			if n.earnedVotes > uint32(len(n.peers)/2) {
-				n.toLeader()
-			}
-		}
-	}
-	return nil
+// sendEventToPeer uses a short timeout to send an event to a peer.
+func (n *Node) sendEventToPeer(ctx context.Context, peer *Peer, event *Event) error {
+	// Create a separate context with a short timeout for sending
+	c, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	return peer.SendEvent(c, event)
 }
