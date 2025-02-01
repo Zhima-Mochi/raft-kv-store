@@ -4,7 +4,7 @@
 // - protoc             v3.21.12
 // source: node_event.proto
 
-package node
+package pb
 
 import (
 	context "context"

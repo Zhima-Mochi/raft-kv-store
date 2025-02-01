@@ -3,14 +3,16 @@ package node
 import (
 	"context"
 	"time"
+
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 )
 
 type Role interface {
 	Enter(ctx context.Context) error
 	OnExit() error
 	Name() string
-	HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error)
+	HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
+	HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
 }
 
 type RoleName uint8

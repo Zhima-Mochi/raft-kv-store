@@ -9,12 +9,13 @@ import (
 	"sync/atomic"
 
 	"github.com/Zhima-Mochi/raft-kv-store/logger"
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	grpc "google.golang.org/grpc"
 )
 
-var _ RaftServer = (*Node)(nil)
+var _ pb.RaftServer = (*Node)(nil)
 
 type Node struct {
 	ID     uuid.UUID
@@ -35,7 +36,7 @@ type Node struct {
 	earnedVotes uint32
 
 	// UnimplementedRaftServer is used to implement the RaftServer interface
-	UnimplementedRaftServer
+	pb.UnimplementedRaftServer
 
 	// The node's current role (Follower/Candidate/Leader)
 	role      Role
@@ -45,7 +46,7 @@ type Node struct {
 	peers     map[uuid.UUID]Peer
 	peerMutex sync.RWMutex
 
-	entries []*LogEntry
+	entries []*pb.LogEntry
 }
 
 // New creates a new Node with some default values.
@@ -81,7 +82,7 @@ func (n *Node) run() {
 		log.Fatalf("[Node %s] failed to listen: %v", n.ID.String(), err)
 	}
 	server := grpc.NewServer()
-	RegisterRaftServer(server, n)
+	pb.RegisterRaftServer(server, n)
 	if err := server.Serve(listener); err != nil {
 		log.Fatalf("[Node %s] failed to serve: %v", n.ID.String(), err)
 	}
@@ -149,11 +150,11 @@ func (n *Node) GetPeer(id uuid.UUID) (Peer, bool) {
 	return peer, ok
 }
 
-func (n *Node) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	return n.role.HandleAppendEntries(ctx, req)
 }
 
-func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (n *Node) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	return n.role.HandleRequestVote(ctx, req)
 }
 

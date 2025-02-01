@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"time"
+
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 )
 
 var _ Role = (*LeaderRole)(nil)
@@ -66,7 +68,7 @@ func (ls *LeaderRole) OnExit() error {
 	return nil
 }
 
-func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
 		"leader_id": req.LeaderId.Value,
 	})
@@ -75,19 +77,19 @@ func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *AppendEntrie
 	if req.Term > ls.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
 		ls.node.StepDown(ls, RoleNameFollower)
-		return &AppendEntriesResponse{
+		return &pb.AppendEntriesResponse{
 			CurrentTerm: req.Term,
 			Success:     true,
 		}, nil
 	}
 
-	return &AppendEntriesResponse{
+	return &pb.AppendEntriesResponse{
 		CurrentTerm: ls.node.currentTerm,
 		Success:     false,
 	}, nil
 }
 
-func (ls *LeaderRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (ls *LeaderRole) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
 		"candidate_id": req.CandidateId.Value,
 	})
@@ -96,13 +98,13 @@ func (ls *LeaderRole) HandleRequestVote(ctx context.Context, req *RequestVoteReq
 	if req.Term > ls.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
 		ls.node.StepDown(ls, RoleNameFollower)
-		return &RequestVoteResponse{
+		return &pb.RequestVoteResponse{
 			CurrentTerm: req.Term,
 			VoteGranted: false,
 		}, nil
 	}
 
-	return &RequestVoteResponse{
+	return &pb.RequestVoteResponse{
 		CurrentTerm: ls.node.currentTerm,
 		VoteGranted: false,
 	}, nil
@@ -113,9 +115,9 @@ func (ls *LeaderRole) sendHeartbeats(ctx context.Context) {
 
 	for _, peer := range ls.node.GetPeers() {
 		go func(peer Peer) {
-			resp, err := peer.AppendEntries(ctx, &AppendEntriesRequest{
+			resp, err := peer.AppendEntries(ctx, &pb.AppendEntriesRequest{
 				Term:     ls.node.currentTerm,
-				LeaderId: &UUID{Value: ls.node.ID.String()},
+				LeaderId: &pb.UUID{Value: ls.node.ID.String()},
 			})
 			if err != nil {
 				log.WithError(err).WithField("peer_id", peer.GetID().String()).Error("Failed to send heartbeat")

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 )
 
 var _ Role = (*CandidateRole)(nil)
@@ -65,6 +67,7 @@ func (cr *CandidateRole) Enter(ctx context.Context) error {
 		case <-timer.C:
 			// Election timeout, start new election if we haven't stepped down
 			if !cr.isEnd.Load() {
+				log.Info("Election timeout, restarting election")
 				cr.node.StepDown(cr, RoleNameCandidate) // Restart election
 			}
 		}
@@ -87,33 +90,33 @@ func (cr *CandidateRole) OnExit() error {
 	return nil
 }
 
-func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	// If we receive an AppendEntries RPC from new leader with higher term
 	if req.Term > cr.node.currentTerm {
 		cr.node.StepDown(cr, RoleNameFollower)
-		return &AppendEntriesResponse{
+		return &pb.AppendEntriesResponse{
 			CurrentTerm: req.Term,
 			Success:     true,
 		}, nil
 	}
 
-	return &AppendEntriesResponse{
+	return &pb.AppendEntriesResponse{
 		CurrentTerm: cr.node.currentTerm,
 		Success:     false,
 	}, nil
 }
 
-func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	// If we receive a RequestVote RPC with higher term
 	if req.Term > cr.node.currentTerm {
 		cr.node.StepDown(cr, RoleNameFollower)
-		return &RequestVoteResponse{
+		return &pb.RequestVoteResponse{
 			CurrentTerm: req.Term,
 			VoteGranted: false,
 		}, nil
 	}
 
-	return &RequestVoteResponse{
+	return &pb.RequestVoteResponse{
 		CurrentTerm: cr.node.currentTerm,
 		VoteGranted: false,
 	}, nil
@@ -126,9 +129,9 @@ func (cr *CandidateRole) startElection(ctx context.Context) {
 	// Send RequestVote RPCs to all peers
 	for _, peer := range cr.node.GetPeers() {
 		go func(peer Peer) {
-			resp, err := peer.RequestVote(ctx, &RequestVoteRequest{
+			resp, err := peer.RequestVote(ctx, &pb.RequestVoteRequest{
 				Term:        cr.node.currentTerm,
-				CandidateId: &UUID{Value: cr.node.ID.String()},
+				CandidateId: &pb.UUID{Value: cr.node.ID.String()},
 			})
 			if err != nil {
 				log.WithError(err).WithField("peer_id", peer.GetID().String()).Error("Failed to send RequestVote")

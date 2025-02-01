@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 	"github.com/google/uuid"
 )
 
@@ -78,7 +79,7 @@ func (fr *FollowerRole) OnExit() error {
 	return nil
 }
 
-func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	log := fr.node.GetLoggerEntry().WithFields(map[string]interface{}{
 		"leader_id": req.LeaderId.Value,
 	})
@@ -86,7 +87,7 @@ func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *AppendEntr
 	// Reply false if term < currentTerm
 	if req.Term < fr.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Rejecting AppendEntries due to lower term")
-		return &AppendEntriesResponse{
+		return &pb.AppendEntriesResponse{
 			CurrentTerm: fr.node.currentTerm,
 			Success:     false,
 		}, nil
@@ -102,13 +103,13 @@ func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *AppendEntr
 	// Update leader ID
 	fr.node.leaderID = uuid.MustParse(req.LeaderId.Value)
 
-	return &AppendEntriesResponse{
+	return &pb.AppendEntriesResponse{
 		CurrentTerm: fr.node.currentTerm,
 		Success:     true,
 	}, nil
 }
 
-func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	log := fr.node.GetLoggerEntry().WithFields(map[string]interface{}{
 		"candidate_id": req.CandidateId.Value,
 	})
@@ -116,7 +117,7 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *RequestVoteR
 	// Reply false if term < currentTerm
 	if req.Term < fr.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Rejecting vote request due to lower term")
-		return &RequestVoteResponse{
+		return &pb.RequestVoteResponse{
 			CurrentTerm: fr.node.currentTerm,
 			VoteGranted: false,
 		}, nil
@@ -133,14 +134,14 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *RequestVoteR
 	if fr.node.voteTo == uuid.Nil || fr.node.voteTo.String() == req.CandidateId.Value {
 		fr.node.voteTo = uuid.MustParse(req.CandidateId.Value)
 		log.Info("Granted vote to candidate")
-		return &RequestVoteResponse{
+		return &pb.RequestVoteResponse{
 			CurrentTerm: fr.node.currentTerm,
 			VoteGranted: true,
 		}, nil
 	}
 
 	log.WithField("voted_for", fr.node.voteTo.String()).Info("Rejecting vote request, already voted")
-	return &RequestVoteResponse{
+	return &pb.RequestVoteResponse{
 		CurrentTerm: fr.node.currentTerm,
 		VoteGranted: false,
 	}, nil

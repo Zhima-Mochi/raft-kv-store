@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Zhima-Mochi/raft-kv-store/logger"
+	"github.com/Zhima-Mochi/raft-kv-store/pb"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -14,8 +15,8 @@ import (
 
 type Peer interface {
 	GetID() uuid.UUID
-	AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	RequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error)
+	AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
+	RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
 	GetLastHeartbeat() time.Time
 	Close() error
 }
@@ -27,7 +28,7 @@ type peer struct {
 	port          string
 	lastHeartbeat time.Time
 	conn          *grpc.ClientConn
-	client        RaftClient // gRPC client interface to communicate with another Raft node
+	client        pb.RaftClient // gRPC client interface to communicate with another Raft node
 }
 
 // NewPeer creates a new Peer instance and establishes a gRPC connection
@@ -48,7 +49,7 @@ func NewPeer(id uuid.UUID, addr, port string) (Peer, error) {
 
 	// Create gRPC client
 	p.conn = conn
-	p.client = NewRaftClient(conn)
+	p.client = pb.NewRaftClient(conn)
 	return p, nil
 }
 
@@ -57,7 +58,7 @@ func (p *peer) GetID() uuid.UUID {
 }
 
 // Send AppendEntries RPC to this peer
-func (p *peer) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (p *peer) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	log := p.GetLoggerEntry().WithFields(map[string]interface{}{
 		"term": req.Term,
 	})
@@ -77,7 +78,7 @@ func (p *peer) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*A
 	return resp, nil
 }
 
-func (p *peer) RequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (p *peer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	log := p.GetLoggerEntry().WithFields(map[string]interface{}{
 		"term":         req.Term,
 		"candidate_id": req.CandidateId.Value,
@@ -117,7 +118,6 @@ func (p *peer) Close() error {
 func (p *peer) GetLastHeartbeat() time.Time {
 	return p.lastHeartbeat
 }
-
 func (p *peer) GetLoggerEntry() *logrus.Entry {
 	return logger.GetLogger().WithFields(map[string]interface{}{
 		"peer_id": p.id.String(),

@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package node;
+package pb;
 
-option go_package = "github.com/Zhima-Mochi/raft-kv-store/node";
+option go_package = "github.com/Zhima-Mochi/raft-kv-store/pb";
 
 // Define Empty message
 message Empty {}
