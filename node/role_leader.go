@@ -69,18 +69,11 @@ func (ls *LeaderRole) OnExit() error {
 }
 
 func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
-		"leader_id": req.LeaderId.Value,
-	})
 
-	// If we receive an AppendEntries RPC from new leader with higher term
+	// Update term if needed
 	if req.Term > ls.node.currentTerm {
-		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
 		ls.node.StepDown(ls, RoleNameFollower)
-		return &pb.AppendEntriesResponse{
-			CurrentTerm: req.Term,
-			Success:     true,
-		}, nil
+		return ls.node.role.HandleAppendEntries(ctx, req)
 	}
 
 	return &pb.AppendEntriesResponse{
@@ -90,18 +83,10 @@ func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEnt
 }
 
 func (ls *LeaderRole) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
-		"candidate_id": req.CandidateId.Value,
-	})
-
-	// If we receive a RequestVote RPC with higher term
+	// Update term if needed
 	if req.Term > ls.node.currentTerm {
-		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
 		ls.node.StepDown(ls, RoleNameFollower)
-		return &pb.RequestVoteResponse{
-			CurrentTerm: req.Term,
-			VoteGranted: false,
-		}, nil
+		return ls.node.RequestVote(ctx, req)
 	}
 
 	return &pb.RequestVoteResponse{

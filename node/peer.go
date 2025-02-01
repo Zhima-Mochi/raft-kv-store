@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Zhima-Mochi/raft-kv-store/logger"
 	"github.com/Zhima-Mochi/raft-kv-store/pb"
 	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -18,6 +16,7 @@ type Peer interface {
 	AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
 	RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
 	GetLastHeartbeat() time.Time
+	UpdateHeartbeat()
 	Close() error
 }
 
@@ -59,56 +58,34 @@ func (p *peer) GetID() uuid.UUID {
 
 // Send AppendEntries RPC to this peer
 func (p *peer) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	log := p.GetLoggerEntry().WithFields(map[string]interface{}{
-		"term": req.Term,
-	})
-
 	resp, err := p.client.AppendEntries(ctx, req)
 	if err != nil {
-		log.WithError(err).Error("Failed to send AppendEntries")
 		return nil, err
 	}
 
-	log.WithFields(map[string]interface{}{
-		"success":      resp.Success,
-		"current_term": resp.CurrentTerm,
-	}).Debug("Received AppendEntries response")
-
 	p.lastHeartbeat = time.Now()
+
 	return resp, nil
 }
 
 func (p *peer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	log := p.GetLoggerEntry().WithFields(map[string]interface{}{
-		"term":         req.Term,
-		"candidate_id": req.CandidateId.Value,
-	})
-
 	resp, err := p.client.RequestVote(ctx, req)
 	if err != nil {
-		log.WithError(err).Error("Failed to send RequestVote")
 		return nil, err
 	}
 
-	log.WithFields(map[string]interface{}{
-		"vote_granted": resp.VoteGranted,
-		"current_term": resp.CurrentTerm,
-	}).Debug("Received RequestVote response")
+	p.lastHeartbeat = time.Now()
 
 	return resp, nil
 }
 
 // Close gRPC connection when shutting down
 func (p *peer) Close() error {
-	log := p.GetLoggerEntry()
-
 	if p.conn != nil {
 		err := p.conn.Close()
 		if err != nil {
-			log.WithError(err).Error("Failed to close connection")
 			return err
 		}
-		log.Info("Disconnected from peer")
 		p.conn = nil
 		p.client = nil
 	}
@@ -118,8 +95,7 @@ func (p *peer) Close() error {
 func (p *peer) GetLastHeartbeat() time.Time {
 	return p.lastHeartbeat
 }
-func (p *peer) GetLoggerEntry() *logrus.Entry {
-	return logger.GetLogger().WithFields(map[string]interface{}{
-		"peer_id": p.id.String(),
-	})
+
+func (p *peer) UpdateHeartbeat() {
+	p.lastHeartbeat = time.Now()
 }

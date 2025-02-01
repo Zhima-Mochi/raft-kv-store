@@ -42,8 +42,8 @@ func (fr *FollowerRole) Enter(ctx context.Context) error {
 	fr.ctx = ctx
 	fr.cancel = cancel
 
-	// Start election timer
-	ticker := time.NewTicker(LeaderHeartbeatTimeout)
+	// Start heartbeat timer
+	ticker := time.NewTicker(HeartbeatInterval + time.Duration(fr.rand.Float64()*float64(LeaderHeartbeatTimeout-HeartbeatInterval)))
 
 	go func() {
 		defer ticker.Stop()
@@ -54,9 +54,27 @@ func (fr *FollowerRole) Enter(ctx context.Context) error {
 			case <-ticker.C:
 				// If we haven't received any AppendEntries from leader
 				if !fr.isEnd.Load() {
-					log.Warn("Leader heartbeat timeout, converting to candidate")
-					fr.node.StepDown(fr, RoleNameCandidate)
-					return
+					if fr.node.leaderID == uuid.Nil {
+						log := fr.node.GetLoggerEntry()
+						log.Warn("No leader, converting to candidate")
+						fr.node.StepDown(fr, RoleNameCandidate)
+						return
+					}
+					peer, ok := fr.node.GetPeer(fr.node.leaderID)
+					if !ok {
+						log.WithField("leader_id", fr.node.leaderID.String()).Error("Leader not found")
+						fr.node.StepDown(fr, RoleNameCandidate)
+						return
+					}
+					if time.Since(peer.GetLastHeartbeat()) > LeaderHeartbeatTimeout {
+						log := fr.node.GetLoggerEntry()
+						log.WithFields(map[string]interface{}{
+							"leader_id":      fr.node.leaderID.String(),
+							"last_heartbeat": peer.GetLastHeartbeat(),
+						}).Warn("Leader heartbeat timeout, converting to candidate")
+						fr.node.StepDown(fr, RoleNameCandidate)
+						return
+					}
 				}
 			}
 		}
@@ -84,6 +102,12 @@ func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *pb.AppendE
 		"leader_id": req.LeaderId.Value,
 	})
 
+	// Update term if needed
+	if req.Term > fr.node.currentTerm {
+		fr.node.UpdateTerm(req.Term)
+		return fr.node.role.HandleAppendEntries(ctx, req)
+	}
+
 	// Reply false if term < currentTerm
 	if req.Term < fr.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Rejecting AppendEntries due to lower term")
@@ -93,15 +117,18 @@ func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *pb.AppendE
 		}, nil
 	}
 
-	// Update term if needed
-	if req.Term > fr.node.currentTerm {
-		fr.node.currentTerm = req.Term
-		fr.node.voteTo = uuid.Nil
-		log.WithField("new_term", req.Term).Info("Updated term from AppendEntries")
+	// check if leader id is valid
+	leaderID := uuid.MustParse(req.LeaderId.Value)
+	if fr.node.leaderID != uuid.Nil && fr.node.leaderID != leaderID {
+		log.WithField("received_leader_id", req.LeaderId.Value).Error("Invalid leader ID")
+		return &pb.AppendEntriesResponse{
+			CurrentTerm: fr.node.currentTerm,
+			Success:     false,
+		}, nil
 	}
 
-	// Update leader ID
-	fr.node.leaderID = uuid.MustParse(req.LeaderId.Value)
+	fr.node.leaderID = leaderID
+	fr.node.voteTo = leaderID
 
 	return &pb.AppendEntriesResponse{
 		CurrentTerm: fr.node.currentTerm,
@@ -114,6 +141,12 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *pb.RequestVo
 		"candidate_id": req.CandidateId.Value,
 	})
 
+	// Update term if needed
+	if req.Term > fr.node.currentTerm {
+		fr.node.UpdateTerm(req.Term)
+		return fr.node.RequestVote(ctx, req)
+	}
+
 	// Reply false if term < currentTerm
 	if req.Term < fr.node.currentTerm {
 		log.WithField("received_term", req.Term).Info("Rejecting vote request due to lower term")
@@ -123,16 +156,19 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *pb.RequestVo
 		}, nil
 	}
 
-	// Update term if needed
-	if req.Term > fr.node.currentTerm {
-		fr.node.UpdateTerm(req.Term)
-		log.WithField("new_term", req.Term).Info("Updated term from RequestVote")
+	// check if candidate id is valid
+	candidateID := uuid.MustParse(req.CandidateId.Value)
+	if candidateID == uuid.Nil {
+		log.WithField("received_candidate_id", req.CandidateId.Value).Error("Invalid candidate ID")
+		return &pb.RequestVoteResponse{
+			CurrentTerm: fr.node.currentTerm,
+			VoteGranted: false,
+		}, nil
 	}
 
-	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
-	if fr.node.voteTo == uuid.Nil || fr.node.voteTo.String() == req.CandidateId.Value {
-		fr.node.voteTo = uuid.MustParse(req.CandidateId.Value)
-		log.Info("Granted vote to candidate")
+	if fr.node.voteTo == uuid.Nil {
+		log.WithField("voted_for", fr.node.voteTo.String()).Info("Granted vote to candidate")
+		fr.node.voteTo = candidateID
 		return &pb.RequestVoteResponse{
 			CurrentTerm: fr.node.currentTerm,
 			VoteGranted: true,

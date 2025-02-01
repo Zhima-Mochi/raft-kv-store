@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Zhima-Mochi/raft-kv-store/pb"
+	"github.com/google/uuid"
 )
 
 var _ Role = (*CandidateRole)(nil)
@@ -94,10 +95,7 @@ func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *pb.Append
 	if req.Term > cr.node.currentTerm {
 		cr.node.UpdateTerm(req.Term)
 		cr.node.StepDown(cr, RoleNameFollower)
-		return &pb.AppendEntriesResponse{
-			CurrentTerm: req.Term,
-			Success:     true,
-		}, nil
+		return cr.node.role.HandleAppendEntries(ctx, req)
 	}
 
 	return &pb.AppendEntriesResponse{
@@ -110,6 +108,12 @@ func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *pb.RequestV
 	log := cr.node.GetLoggerEntry().WithFields(map[string]interface{}{
 		"candidate_id": req.CandidateId.Value,
 	})
+
+	// Update term if needed
+	if req.Term > cr.node.currentTerm {
+		cr.node.StepDown(cr, RoleNameCandidate)
+		return cr.node.RequestVote(ctx, req)
+	}
 
 	// Reply false if term < currentTerm
 	if req.Term < cr.node.currentTerm {
@@ -134,11 +138,21 @@ func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *pb.RequestV
 
 	log.WithField("received_term", req.Term).Info("Received higher term, updating term")
 	cr.node.UpdateTerm(req.Term)
+	leaderID := uuid.MustParse(req.CandidateId.Value)
+	if leaderID == uuid.Nil {
+		return nil, errors.New("invalid leader ID")
+	}
+	cr.node.leaderID = leaderID
+	cr.node.voteTo = leaderID
+
 	// Step down to follower since we discovered a higher term
 	cr.node.StepDown(cr, RoleNameFollower)
 
 	// Continue with vote handling as a follower would
-	return cr.node.RequestVote(ctx, req)
+	return &pb.RequestVoteResponse{
+		CurrentTerm: cr.node.currentTerm,
+		VoteGranted: true,
+	}, nil
 }
 
 func (cr *CandidateRole) startElection(ctx context.Context) {
@@ -152,6 +166,10 @@ func (cr *CandidateRole) startElection(ctx context.Context) {
 				Term:        cr.node.currentTerm,
 				CandidateId: &pb.UUID{Value: cr.node.ID.String()},
 			})
+			// check if the role is ended
+			if cr.isEnd.Load() {
+				return
+			}
 			if err != nil {
 				log.WithError(err).WithField("peer_id", peer.GetID().String()).Error("Failed to send RequestVote")
 				return

@@ -5,3 +5,6 @@ proto:
 	       --go_opt=module=github.com/Zhima-Mochi/raft-kv-store \
 	       --go-grpc_opt=module=github.com/Zhima-Mochi/raft-kv-store \
 	       -I proto proto/*.proto
+
+run:
+	go run main.go

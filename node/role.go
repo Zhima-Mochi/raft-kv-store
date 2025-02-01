@@ -28,6 +28,6 @@ func (r RoleName) String() string {
 }
 
 var (
-	HeartbeatInterval      = 2000 * time.Millisecond
+	HeartbeatInterval      = 200 * time.Millisecond
 	LeaderHeartbeatTimeout = 3 * HeartbeatInterval
 )

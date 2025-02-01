@@ -152,11 +152,23 @@ func (n *Node) GetPeer(id uuid.UUID) (Peer, bool) {
 	return peer, ok
 }
 
+func (n *Node) UpdatePeerHeartbeat(id uuid.UUID) {
+	n.peerMutex.Lock()
+	defer n.peerMutex.Unlock()
+	peer, ok := n.peers[id]
+	if !ok {
+		return
+	}
+	peer.UpdateHeartbeat()
+}
+
 func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	n.UpdatePeerHeartbeat(uuid.MustParse(req.LeaderId.Value))
 	return n.role.HandleAppendEntries(ctx, req)
 }
 
 func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	n.UpdatePeerHeartbeat(uuid.MustParse(req.CandidateId.Value))
 	return n.role.HandleRequestVote(ctx, req)
 }
 
@@ -166,7 +178,7 @@ func (n *Node) StepDown(oldRole Role, newRole RoleName) {
 
 	if oldRole != nil {
 		if err := oldRole.OnExit(); err != nil {
-			log.Printf("[Node %s] previous role failed to exit: %s", n.ID.String(), err)
+			logger.GetLogger().WithField("error", err).Warn("Role failed to exit")
 			return
 		}
 	}
@@ -179,6 +191,7 @@ func (n *Node) StepDown(oldRole Role, newRole RoleName) {
 	case RoleNameLeader:
 		n.role = NewLeaderRole(n)
 	}
+
 	n.role.Enter(n.ctx)
 }
 
