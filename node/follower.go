@@ -3,123 +3,164 @@ package node
 import (
 	"context"
 	"errors"
-	"log"
+	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
-type FollowerState struct {
-	node     *Node
-	leaderID uuid.UUID
+var _ Role = (*FollowerRole)(nil)
+
+type FollowerRole struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	node   *Node
+	rand   *rand.Rand
+
+	isEnd atomic.Bool
 }
 
-func NewFollowerState(node *Node, leaderID uuid.UUID) *FollowerState {
-	return &FollowerState{
-		node:     node,
-		leaderID: leaderID,
+func NewFollowerRole(node *Node) *FollowerRole {
+	return &FollowerRole{
+		node: node,
+		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
-func (fs *FollowerState) getRole() Role {
-	return FollowerRole
+func (fr *FollowerRole) Name() string {
+	return RoleNameFollower.String()
 }
 
-func (fs *FollowerState) run(ctx context.Context) {
-	log.Printf("[Follower %s] Follower state running", fs.node.id.String())
-	ticker := time.NewTicker(LeaderHeartbeatTimeout)
-	defer ticker.Stop()
+func (fr *FollowerRole) Enter(ctx context.Context) error {
+	log := fr.node.GetLoggerEntry()
+	log.Info("Entering Follower state")
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			fs.checkLeaderAlive(ctx)
-		}
-	}
-}
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(ctx)
+	fr.ctx = ctx
+	fr.cancel = cancel
 
-func (fs *FollowerState) onExit() {
-	log.Printf("[Follower %s] Exiting Follower state", fs.node.id.String())
-}
+	// Start election timer
+	ticker := time.NewTicker(ElectionTimeoutMin + time.Duration(fr.rand.Float64()*float64(ElectionTimeoutMax-ElectionTimeoutMin)))
 
-func (fs *FollowerState) handleEvent(ctx context.Context, event *Event) error {
-	fromUUID, err := uuid.Parse(event.From.Value)
-	if err != nil {
-		return err
-	}
-
-	// If event has a higher term, step down.
-	if fs.node.updateTermAndStepDown(ctx, event.Term, fromUUID) {
-		return nil
-	}
-
-	switch event.Type {
-	case EventType_EVENT_TYPE_HEARTBEAT:
-		peer, ok := fs.node.peers[fromUUID]
-		if !ok {
-			return errors.New("follower received heartbeat from unknown peer")
-		}
-		if fs.leaderID != fromUUID {
-			fs.leaderID = fromUUID
-			fs.node.termMutex.Lock()
-			fs.node.leaderID = fromUUID
-			fs.node.termMutex.Unlock()
-		}
-		peer.lastHeartbeat = time.Now()
-
-		log.Printf("[Follower %s] Heartbeat from leader %s", fs.node.id.String(), fromUUID.String())
-
-	case EventType_EVENT_TYPE_VOTE_REQUEST:
-		// If we haven't voted yet, vote for the requester
-		fs.node.termMutex.Lock()
-		if fs.node.voteTo == uuid.Nil {
-			fs.node.voteTo = fromUUID
-			fs.node.termMutex.Unlock()
-
-			// Send vote response
-			vote := &Vote{VoteTo: fs.node.id}
-			b, err := vote.Serialize()
-			if err != nil {
-				return err
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// If we haven't received any AppendEntries from leader
+				if !fr.isEnd.Load() {
+					log.Info("Election timeout, converting to candidate")
+					fr.node.StepDown(fr, RoleNameCandidate)
+					return
+				}
 			}
-			peer, ok := fs.node.peers[fromUUID]
-			if ok {
-				return fs.node.sendEventToPeer(ctx, peer, &Event{
-					Type: EventType_EVENT_TYPE_VOTE_RESPONSE,
-					From: &UUID{Value: fs.node.id.String()},
-					Data: &anypb.Any{Value: b},
-					Term: fs.node.currentTerm, // currentTerm safe to read under termMutex or in a snapshot
-				})
-			}
-		} else {
-			fs.node.termMutex.Unlock()
 		}
+	}()
 
-	case EventType_EVENT_TYPE_VOTE_RESPONSE:
-		// Follower ignores vote responses
-		return nil
+	return nil
+}
+
+func (fr *FollowerRole) OnExit() error {
+	log := fr.node.GetLoggerEntry()
+	log.Info("Exiting Follower state")
+
+	if fr.cancel != nil {
+		fr.cancel()
+	}
+
+	if !fr.isEnd.CompareAndSwap(false, true) {
+		return errors.New("follower already ended")
 	}
 	return nil
 }
 
-func (fs *FollowerState) checkLeaderAlive(ctx context.Context) {
-	fs.node.peerMutex.RLock()
-	leader, ok := fs.node.peers[fs.leaderID]
-	fs.node.peerMutex.RUnlock()
+func (fr *FollowerRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	log := fr.node.GetLoggerEntry().WithFields(map[string]interface{}{
+		"leader_id": req.LeaderId.Value,
+	})
 
+	// Reply false if term < currentTerm
+	if req.Term < fr.node.currentTerm {
+		log.WithField("received_term", req.Term).Info("Rejecting AppendEntries due to lower term")
+		return &AppendEntriesResponse{
+			CurrentTerm: fr.node.currentTerm,
+			Success:     false,
+		}, nil
+	}
+
+	// Update term if needed
+	if req.Term > fr.node.currentTerm {
+		fr.node.currentTerm = req.Term
+		fr.node.voteTo = uuid.Nil
+		log.WithField("new_term", req.Term).Info("Updated term from AppendEntries")
+	}
+
+	// Update leader ID
+	fr.node.leaderID = uuid.MustParse(req.LeaderId.Value)
+
+	return &AppendEntriesResponse{
+		CurrentTerm: fr.node.currentTerm,
+		Success:     true,
+	}, nil
+}
+
+func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	log := fr.node.GetLoggerEntry().WithFields(map[string]interface{}{
+		"candidate_id": req.CandidateId.Value,
+	})
+
+	// Reply false if term < currentTerm
+	if req.Term < fr.node.currentTerm {
+		log.WithField("received_term", req.Term).Info("Rejecting vote request due to lower term")
+		return &RequestVoteResponse{
+			CurrentTerm: fr.node.currentTerm,
+			VoteGranted: false,
+		}, nil
+	}
+
+	// Update term if needed
+	if req.Term > fr.node.currentTerm {
+		fr.node.currentTerm = req.Term
+		fr.node.voteTo = uuid.Nil
+		log.WithField("new_term", req.Term).Info("Updated term from RequestVote")
+	}
+
+	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
+	if fr.node.voteTo == uuid.Nil || fr.node.voteTo.String() == req.CandidateId.Value {
+		fr.node.voteTo = uuid.MustParse(req.CandidateId.Value)
+		log.Info("Granted vote to candidate")
+		return &RequestVoteResponse{
+			CurrentTerm: fr.node.currentTerm,
+			VoteGranted: true,
+		}, nil
+	}
+
+	log.WithField("voted_for", fr.node.voteTo.String()).Info("Rejecting vote request, already voted")
+	return &RequestVoteResponse{
+		CurrentTerm: fr.node.currentTerm,
+		VoteGranted: false,
+	}, nil
+}
+
+func (fr *FollowerRole) resetElectionTimer() {
+	// Random timeout between ElectionTimeoutMin and ElectionTimeoutMax
+	timeout := ElectionTimeoutMin + time.Duration(fr.rand.Float64()*float64(ElectionTimeoutMax-ElectionTimeoutMin))
+
+	time.AfterFunc(timeout, func() {
+		if fr.node.role.Name() == RoleNameFollower.String() {
+			fr.node.StepDown(fr, RoleNameCandidate)
+		}
+	})
+}
+
+func (fr *FollowerRole) checkLeaderAlive(ctx context.Context) bool {
+	leader, ok := fr.node.GetPeer(fr.node.leaderID)
 	if !ok {
-		// Leader not found -> become candidate
-		log.Printf("[Follower %s] Leader %s missing -> become candidate", fs.node.id.String(), fs.leaderID.String())
-		fs.node.setState(ctx, NewCandidateState(fs.node))
-		return
+		return false
 	}
-
-	if time.Since(leader.lastHeartbeat) > LeaderHeartbeatTimeout {
-		// Leader timed out -> become candidate
-		log.Printf("[Follower %s] Leader %s timed out -> become candidate", fs.node.id.String(), fs.leaderID.String())
-		fs.node.setState(ctx, NewCandidateState(fs.node))
-	}
+	return time.Since(leader.GetLastHeartbeat()) <= LeaderHeartbeatTimeout
 }

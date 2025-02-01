@@ -2,116 +2,153 @@ package node
 
 import (
 	"context"
-	"log"
+	"errors"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-type CandidateState struct {
-	node *Node
+var _ Role = (*CandidateRole)(nil)
+
+type CandidateRole struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	node   *Node
+	rand   *rand.Rand
+
+	isEnd atomic.Bool
+
+	votesReceived int
+	voteMutex     sync.Mutex
 }
 
-func NewCandidateState(node *Node) *CandidateState {
-	return &CandidateState{node: node}
+func NewCandidateRole(node *Node) *CandidateRole {
+	return &CandidateRole{
+		node:          node,
+		rand:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		votesReceived: 1, // Vote for self
+	}
 }
 
-func (cs *CandidateState) getRole() Role {
-	return CandidateRole
+func (cr *CandidateRole) Name() string {
+	return RoleNameCandidate.String()
 }
 
-func (cs *CandidateState) run(ctx context.Context) {
-	cs.startElection(ctx)
+func (cr *CandidateRole) Enter(ctx context.Context) error {
+	log := cr.node.GetLoggerEntry()
+	log.Info("Entering Candidate state")
 
-	// Generate a random election timeout
-	randTimeout := time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin))) + ElectionTimeoutMin
-	electionTicker := time.NewTicker(randTimeout)
-	defer electionTicker.Stop()
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(ctx)
+	cr.ctx = ctx
+	cr.cancel = cancel
 
-	for {
+	// Increment current term and vote for self
+	cr.node.termMutex.Lock()
+	cr.node.currentTerm++
+	cr.node.voteTo = cr.node.ID
+	cr.node.termMutex.Unlock()
+
+	// Start election
+	cr.startElection(ctx)
+
+	// Set election timeout
+	timeout := ElectionTimeoutMin + time.Duration(cr.rand.Float64()*float64(ElectionTimeoutMax-ElectionTimeoutMin))
+	timer := time.NewTimer(timeout)
+
+	go func() {
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return
-		case <-electionTicker.C:
-			// If still candidate, start a new election
-			log.Printf("[Candidate %s] Election timeout -> start new election", cs.node.id.String())
-			cs.node.setState(ctx, NewCandidateState(cs.node))
-			return
-		}
-	}
-}
-
-func (cs *CandidateState) onExit() {
-	log.Printf("[Candidate %s] Exiting Candidate state", cs.node.id.String())
-}
-
-func (cs *CandidateState) handleEvent(ctx context.Context, event *Event) error {
-	fromUUID, err := uuid.Parse(event.From.Value)
-	if err != nil {
-		return err
-	}
-
-	// If there's a higher term, step down
-	if cs.node.updateTermAndStepDown(ctx, event.Term, fromUUID) {
-		return nil
-	}
-
-	switch event.Type {
-	case EventType_EVENT_TYPE_HEARTBEAT:
-		// Another leader is out there -> become follower
-		cs.node.setState(ctx, NewFollowerState(cs.node, fromUUID))
-		return nil
-
-	case EventType_EVENT_TYPE_VOTE_REQUEST:
-		// Typically candidate might ignore or reject other requests in same term
-		return nil
-
-	case EventType_EVENT_TYPE_VOTE_RESPONSE:
-		vote := &Vote{}
-		if err := vote.Deserialize(event.Data.Value); err != nil {
-			return err
-		}
-		if vote.VoteTo == cs.node.id {
-			cs.node.incrementEarnedVotes()
-			earned := cs.node.getEarnedVotes()
-
-			// Check if majority
-			cs.node.peerMutex.RLock()
-			totalPeers := len(cs.node.peers) + 1 // include self
-			cs.node.peerMutex.RUnlock()
-
-			if int(earned) > totalPeers/2 {
-				cs.node.setState(ctx, NewLeaderState(cs.node))
+		case <-timer.C:
+			// Election timeout, start new election if we haven't stepped down
+			if !cr.isEnd.Load() {
+				cr.node.StepDown(cr, RoleNameCandidate) // Restart election
 			}
 		}
+	}()
+
+	return nil
+}
+
+func (cr *CandidateRole) OnExit() error {
+	log := cr.node.GetLoggerEntry()
+	log.Info("Exiting Candidate state")
+
+	if cr.cancel != nil {
+		cr.cancel()
+	}
+
+	if !cr.isEnd.CompareAndSwap(false, true) {
+		return errors.New("candidate already ended")
 	}
 	return nil
 }
 
-func (cs *CandidateState) startElection(ctx context.Context) {
-	// Bump term, reset votes
-	cs.node.termMutex.Lock()
-	cs.node.currentTerm++
-	newTerm := cs.node.currentTerm
-	cs.node.voteTo = cs.node.id
-	cs.node.resetEarnedVotes()
-	cs.node.incrementEarnedVotes() // vote for self
-	cs.node.termMutex.Unlock()
+func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	// If we receive an AppendEntries RPC from new leader with higher term
+	if req.Term > cr.node.currentTerm {
+		cr.node.StepDown(cr, RoleNameFollower)
+		return &AppendEntriesResponse{
+			CurrentTerm: req.Term,
+			Success:     true,
+		}, nil
+	}
 
-	log.Printf("[Candidate %s] Starting election in term %d", cs.node.id.String(), newTerm)
+	return &AppendEntriesResponse{
+		CurrentTerm: cr.node.currentTerm,
+		Success:     false,
+	}, nil
+}
 
-	// Send vote requests to peers
-	cs.node.peerMutex.RLock()
-	defer cs.node.peerMutex.RUnlock()
+func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	// If we receive a RequestVote RPC with higher term
+	if req.Term > cr.node.currentTerm {
+		cr.node.StepDown(cr, RoleNameFollower)
+		return &RequestVoteResponse{
+			CurrentTerm: req.Term,
+			VoteGranted: false,
+		}, nil
+	}
 
-	for _, p := range cs.node.peers {
-		go func(peer *Peer) {
-			cs.node.sendEventToPeer(ctx, peer, &Event{
-				Type: EventType_EVENT_TYPE_VOTE_REQUEST,
-				From: &UUID{Value: cs.node.id.String()},
-				Term: newTerm,
+	return &RequestVoteResponse{
+		CurrentTerm: cr.node.currentTerm,
+		VoteGranted: false,
+	}, nil
+}
+
+func (cr *CandidateRole) startElection(ctx context.Context) {
+	log := cr.node.GetLoggerEntry()
+	log.Info("Starting election")
+
+	// Send RequestVote RPCs to all peers
+	for _, peer := range cr.node.GetPeers() {
+		go func(peer Peer) {
+			resp, err := peer.RequestVote(ctx, &RequestVoteRequest{
+				Term:        cr.node.currentTerm,
+				CandidateId: &UUID{Value: cr.node.ID.String()},
 			})
-		}(p)
+			if err != nil {
+				log.WithError(err).WithField("peer_id", peer.GetID().String()).Error("Failed to send RequestVote")
+				return
+			}
+
+			if resp.VoteGranted {
+				cr.voteMutex.Lock()
+				cr.votesReceived++
+
+				// Check if we have majority
+				if cr.votesReceived > (len(cr.node.peers)+1)/2 {
+					log.Info("Received majority votes, becoming leader")
+					cr.node.StepDown(cr, RoleNameLeader)
+				}
+				cr.voteMutex.Unlock()
+			} else if resp.CurrentTerm > cr.node.currentTerm {
+				log.WithField("received_term", resp.CurrentTerm).Info("Received higher term, stepping down")
+				cr.node.StepDown(cr, RoleNameFollower)
+			}
+		}(peer)
 	}
 }

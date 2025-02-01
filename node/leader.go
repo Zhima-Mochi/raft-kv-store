@@ -2,90 +2,130 @@ package node
 
 import (
 	"context"
-	"log"
+	"errors"
+	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-type LeaderState struct {
-	node *Node
+var _ Role = (*LeaderRole)(nil)
+
+type LeaderRole struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	node   *Node
+
+	isEnd atomic.Bool
 }
 
-func NewLeaderState(node *Node) *LeaderState {
-	return &LeaderState{node: node}
+func NewLeaderRole(node *Node) *LeaderRole {
+	return &LeaderRole{node: node}
 }
 
-func (ls *LeaderState) getRole() Role {
-	return LeaderRole
+func (ls *LeaderRole) Name() string {
+	return RoleNameLeader.String()
 }
 
-func (ls *LeaderState) run(ctx context.Context) {
-	log.Printf("[Leader %s] Leader state running", ls.node.id.String())
+func (ls *LeaderRole) Enter(ctx context.Context) error {
+	log := ls.node.GetLoggerEntry()
+	log.Info("Entering Leader state")
 
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(ctx)
+	ls.ctx = ctx
+	ls.cancel = cancel
+
+	// Start heartbeat ticker
 	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			ls.sendHeartbeats(ctx)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ls.sendHeartbeats(ctx)
+			}
 		}
-	}
+	}()
+
+	return nil
 }
 
-func (ls *LeaderState) onExit() {
-	log.Printf("[Leader %s] Exiting Leader state", ls.node.id.String())
-}
+func (ls *LeaderRole) OnExit() error {
+	log := ls.node.GetLoggerEntry()
+	log.Info("Exiting Leader state")
 
-func (ls *LeaderState) handleEvent(ctx context.Context, event *Event) error {
-	fromUUID, err := uuid.Parse(event.From.Value)
-	if err != nil {
-		return err
+	if ls.cancel != nil {
+		ls.cancel()
 	}
 
-	// If there's a higher term, step down
-	if ls.node.updateTermAndStepDown(ctx, event.Term, fromUUID) {
-		return nil
-	}
-
-	switch event.Type {
-	case EventType_EVENT_TYPE_HEARTBEAT:
-		// Leader ignores heartbeats from others with the same or lower term
-		return nil
-	case EventType_EVENT_TYPE_VOTE_REQUEST:
-		// If another candidate is requesting votes with the same term, we typically ignore.
-		// If the candidate's term is higher, updateTermAndStepDown above already handled it.
-		return nil
-	case EventType_EVENT_TYPE_VOTE_RESPONSE:
-		// Leader usually ignores vote responses after becoming leader
-		return nil
+	if !ls.isEnd.CompareAndSwap(false, true) {
+		return errors.New("leader already ended")
 	}
 	return nil
 }
 
-func (ls *LeaderState) sendHeartbeats(ctx context.Context) {
-	ls.node.termMutex.RLock()
-	currentTerm := ls.node.currentTerm
-	ls.node.termMutex.RUnlock()
+func (ls *LeaderRole) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
+		"leader_id": req.LeaderId.Value,
+	})
 
-	log.Printf("[Leader %s] Sending heartbeats (term %d)", ls.node.id.String(), currentTerm)
+	// If we receive an AppendEntries RPC from new leader with higher term
+	if req.Term > ls.node.currentTerm {
+		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
+		ls.node.StepDown(ls, RoleNameFollower)
+		return &AppendEntriesResponse{
+			CurrentTerm: req.Term,
+			Success:     true,
+		}, nil
+	}
 
-	ls.node.peerMutex.RLock()
-	defer ls.node.peerMutex.RUnlock()
+	return &AppendEntriesResponse{
+		CurrentTerm: ls.node.currentTerm,
+		Success:     false,
+	}, nil
+}
 
-	for _, peer := range ls.node.peers {
-		go func(p *Peer) {
-			hbCtx, cancel := context.WithTimeout(ctx, HeartbeatInterval)
-			defer cancel()
+func (ls *LeaderRole) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	log := ls.node.GetLoggerEntry().WithFields(map[string]interface{}{
+		"candidate_id": req.CandidateId.Value,
+	})
 
-			ls.node.sendEventToPeer(hbCtx, p, &Event{
-				Type: EventType_EVENT_TYPE_HEARTBEAT,
-				From: &UUID{Value: ls.node.id.String()},
-				Term: currentTerm,
+	// If we receive a RequestVote RPC with higher term
+	if req.Term > ls.node.currentTerm {
+		log.WithField("received_term", req.Term).Info("Received higher term, stepping down")
+		ls.node.StepDown(ls, RoleNameFollower)
+		return &RequestVoteResponse{
+			CurrentTerm: req.Term,
+			VoteGranted: false,
+		}, nil
+	}
+
+	return &RequestVoteResponse{
+		CurrentTerm: ls.node.currentTerm,
+		VoteGranted: false,
+	}, nil
+}
+
+func (ls *LeaderRole) sendHeartbeats(ctx context.Context) {
+	log := ls.node.GetLoggerEntry()
+
+	for _, peer := range ls.node.GetPeers() {
+		go func(peer Peer) {
+			resp, err := peer.AppendEntries(ctx, &AppendEntriesRequest{
+				Term:     ls.node.currentTerm,
+				LeaderId: &UUID{Value: ls.node.ID.String()},
 			})
+			if err != nil {
+				log.WithError(err).WithField("peer_id", peer.GetID().String()).Error("Failed to send heartbeat")
+				return
+			}
+
+			if resp.CurrentTerm > ls.node.currentTerm {
+				log.WithField("received_term", resp.CurrentTerm).Info("Received higher term in heartbeat response, stepping down")
+				ls.node.StepDown(ls, RoleNameFollower)
+			}
 		}(peer)
 	}
 }

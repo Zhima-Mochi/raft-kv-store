@@ -2,17 +2,27 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
+	"github.com/Zhima-Mochi/raft-kv-store/logger"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+	grpc "google.golang.org/grpc"
 )
 
+var _ RaftServer = (*Node)(nil)
+
 type Node struct {
-	id uuid.UUID
-	es EventService
+	ID     uuid.UUID
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	address string
+	port    string
 
 	// Protects term, voteTo, leaderID, earnedVotes
 	termMutex sync.RWMutex
@@ -24,117 +34,69 @@ type Node struct {
 	// earnedVotes is used with atomic operations
 	earnedVotes uint32
 
-	// The node's current state (Follower/Candidate/Leader)
-	state      RoleState
-	stateMutex sync.RWMutex
+	// UnimplementedRaftServer is used to implement the RaftServer interface
+	UnimplementedRaftServer
 
-	// Context management for the current RoleState
-	roleCtx    context.Context
-	roleCancel context.CancelFunc
+	// The node's current role (Follower/Candidate/Leader)
+	role      Role
+	roleMutex sync.RWMutex
 
 	// Holds references to other cluster members
-	peers     map[uuid.UUID]*Peer
+	peers     map[uuid.UUID]Peer
 	peerMutex sync.RWMutex
 
-	// Channel for receiving events
-	eventChan chan *Event
+	entries []*LogEntry
 }
 
 // New creates a new Node with some default values.
-func New(id uuid.UUID, es EventService) *Node {
+func New(id uuid.UUID, address, port string) *Node {
+
 	node := &Node{
-		id:        id,
-		es:        es,
-		voteTo:    uuid.Nil,
-		peers:     make(map[uuid.UUID]*Peer),
-		eventChan: make(chan *Event, 1024),
+		ID:      id,
+		address: address,
+		port:    port,
+		voteTo:  uuid.Nil,
+		peers:   make(map[uuid.UUID]Peer),
 	}
 	return node
 }
 
+func (n *Node) GetTerm() uint64 {
+	n.termMutex.Lock()
+	defer n.termMutex.Unlock()
+	return n.currentTerm
+}
+
 // Run starts this Node as a Follower by default, then listens for incoming events.
 func (n *Node) Run(ctx context.Context) {
-	// Start in Follower state (leaderID = uuid.Nil initially)
-	n.setState(ctx, NewFollowerState(n, uuid.Nil))
+	n.ctx = ctx
 
-	for {
-		select {
-		case <-ctx.Done():
-			// Cancel current state’s context
-			if n.roleCancel != nil {
-				n.roleCancel()
-			}
-			return
-		case event := <-n.eventChan:
-			// Delegate event handling to current state
-			st := n.getCurrentState()
-			if st != nil {
-				if err := st.handleEvent(n.roleCtx, event); err != nil {
-					log.Printf("[Node %s] Error handling event: %v", n.id.String(), err)
-				}
-			}
-		}
+	n.StepDown(nil, RoleNameFollower)
+	n.run()
+}
+
+func (n *Node) run() {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", n.address, n.port))
+	if err != nil {
+		log.Fatalf("[Node %s] failed to listen: %v", n.ID.String(), err)
+	}
+	server := grpc.NewServer()
+	RegisterRaftServer(server, n)
+	if err := server.Serve(listener); err != nil {
+		log.Fatalf("[Node %s] failed to serve: %v", n.ID.String(), err)
 	}
 }
 
-// updateTermAndStepDown atomically checks and steps down to a new term if eventTerm is larger.
-func (n *Node) updateTermAndStepDown(ctx context.Context, eventTerm uint64, leaderID uuid.UUID) bool {
+// updateTerm atomically checks and steps down to a new term if eventTerm is larger.
+func (n *Node) UpdateTerm(term uint64) bool {
 	n.termMutex.Lock()
 	defer n.termMutex.Unlock()
 
-	if eventTerm > n.currentTerm {
-		n.currentTerm = eventTerm
-		n.voteTo = uuid.Nil
-		n.leaderID = leaderID
-		// Step down to Follower
-		n.setState(ctx, NewFollowerState(n, leaderID))
+	if term > n.currentTerm {
+		n.currentTerm = term
 		return true
 	}
 	return false
-}
-
-// getCurrentState safely gets the current RoleState (Follower/Candidate/Leader)
-func (n *Node) getCurrentState() RoleState {
-	n.stateMutex.RLock()
-	defer n.stateMutex.RUnlock()
-	return n.state
-}
-
-// setState transitions the node to a new RoleState.
-func (n *Node) setState(ctx context.Context, newState RoleState) {
-	// Cancel old state context if exists
-	if n.roleCancel != nil {
-		n.roleCancel()
-	}
-
-	// Create a new context for the new state
-	ctx, cancel := context.WithCancel(ctx)
-
-	n.stateMutex.Lock()
-	oldState := n.state
-	n.state = newState
-	n.roleCtx = ctx
-	n.roleCancel = cancel
-	n.stateMutex.Unlock()
-
-	if oldState != nil {
-		oldState.onExit()
-	}
-
-	// Log the role transition
-	n.termMutex.RLock()
-	currentTerm := n.currentTerm
-	n.termMutex.RUnlock()
-
-	log.Printf("[Node %s] Transitioning from %s to %s for term %d",
-		n.id.String(),
-		roleString(oldState),
-		roleString(newState),
-		currentTerm,
-	)
-
-	// Start the new state's run loop
-	go newState.run(ctx)
 }
 
 // resetEarnedVotes atomically resets the earned votes to 0.
@@ -153,35 +115,73 @@ func (n *Node) getEarnedVotes() uint32 {
 }
 
 // AddPeer safely adds a new peer to the node's peer map.
-func (n *Node) AddPeer(peer *Peer) {
+func (n *Node) AddPeer(peer Peer) error {
 	n.peerMutex.Lock()
 	defer n.peerMutex.Unlock()
-	n.peers[peer.id] = peer
+	n.peers[peer.GetID()] = peer
+
+	return nil
 }
 
 // RemovePeer safely remove a peer from the node's peer map.
-func (n *Node) RemovePeer(peer *Peer) {
+func (n *Node) RemovePeer(id uuid.UUID) {
 	n.peerMutex.Lock()
 	defer n.peerMutex.Unlock()
-	delete(n.peers, peer.id)
+	delete(n.peers, id)
 }
 
 // GetPeers safely gets a snapshot of the node's peer map.
-func (n *Node) GetPeers() map[uuid.UUID]*Peer {
+func (n *Node) GetPeers() map[uuid.UUID]Peer {
 	n.peerMutex.RLock()
 	defer n.peerMutex.RUnlock()
 	// Return a shallow copy if we want to avoid concurrency issues
-	snap := make(map[uuid.UUID]*Peer)
+	snap := make(map[uuid.UUID]Peer)
 	for k, v := range n.peers {
 		snap[k] = v
 	}
 	return snap
 }
 
-// sendEventToPeer uses a short timeout to send an event to a peer.
-func (n *Node) sendEventToPeer(ctx context.Context, peer *Peer, event *Event) error {
-	// Create a separate context with a short timeout for sending
-	c, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	return peer.SendEvent(c, event)
+func (n *Node) GetPeer(id uuid.UUID) (Peer, bool) {
+	n.peerMutex.RLock()
+	defer n.peerMutex.RUnlock()
+	peer, ok := n.peers[id]
+	return peer, ok
+}
+
+func (n *Node) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	return n.role.HandleAppendEntries(ctx, req)
+}
+
+func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	return n.role.HandleRequestVote(ctx, req)
+}
+
+func (n *Node) StepDown(oldRole Role, newRole RoleName) {
+	n.roleMutex.Lock()
+	defer n.roleMutex.Unlock()
+
+	if oldRole != nil {
+		if err := oldRole.OnExit(); err != nil {
+			log.Printf("[Node %s] previous role failed to exit: %s", n.ID.String(), err)
+		}
+	}
+
+	switch newRole {
+	case RoleNameFollower:
+		n.role = NewFollowerRole(n)
+	case RoleNameCandidate:
+		n.role = NewCandidateRole(n)
+	case RoleNameLeader:
+		n.role = NewLeaderRole(n)
+	}
+	n.role.Enter(n.ctx)
+}
+
+func (n *Node) GetLoggerEntry() *logrus.Entry {
+	return logger.GetLogger().WithFields(map[string]interface{}{
+		"node_id": n.ID.String(),
+		"role":    n.role.Name(),
+		"term":    n.currentTerm,
+	})
 }

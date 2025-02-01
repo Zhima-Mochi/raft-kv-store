@@ -1,27 +1,31 @@
 package node
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
-type RoleState interface {
-	run(ctx context.Context)
-	handleEvent(ctx context.Context, e *Event) error
-	onExit()
-	getRole() Role
+type Role interface {
+	Enter(ctx context.Context) error
+	OnExit() error
+	Name() string
+	HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error)
 }
 
-// roleString is a small helper to safely get the role's name
-func roleString(rs RoleState) string {
-	if rs == nil {
-		return "nil"
-	}
-	switch rs.getRole() {
-	case FollowerRole:
-		return "Follower"
-	case CandidateRole:
-		return "Candidate"
-	case LeaderRole:
-		return "Leader"
-	default:
-		return "Unknown"
-	}
+type RoleName uint8
+
+const (
+	RoleNameFollower RoleName = iota
+	RoleNameCandidate
+	RoleNameLeader
+)
+
+func (r RoleName) String() string {
+	return []string{"Follower", "Candidate", "Leader"}[r]
 }
+
+var (
+	HeartbeatInterval      = 200 * time.Millisecond
+	LeaderHeartbeatTimeout = 3 * HeartbeatInterval
+)

@@ -4,32 +4,53 @@ package node;
 
 option go_package = "github.com/Zhima-Mochi/raft-kv-store/node";
 
-import "google/protobuf/any.proto";
-
 // Define Empty message
 message Empty {}
-
-// Define EventType enum
-enum EventType {
-  EVENT_TYPE_UNSPECIFIED = 0;
-  EVENT_TYPE_HEARTBEAT = 1;
-  EVENT_TYPE_VOTE_REQUEST = 2;
-  EVENT_TYPE_VOTE_RESPONSE = 3;
-}
 
 // Define UUID message since protobuf doesn't have a native UUID type
 message UUID {
   string value = 1;
 }
 
-service Node {
-  rpc SendEvent(Event) returns (Empty);
+// Raft service for Raft protocol communication
+service Raft {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
 }
 
-message Event {
-  EventType type = 1;
-  UUID from = 2;
-  uint64 term = 3;
-  google.protobuf.Any data = 4;
+// AppendEntries RPC request
+message AppendEntriesRequest {
+  uint64 term = 1;
+  UUID leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
 }
 
+// AppendEntries RPC response
+message AppendEntriesResponse {
+  uint64 current_term = 1;
+  bool success = 2;
+}
+
+// RequestVote RPC request
+message RequestVoteRequest {
+  uint64 term = 1;
+  UUID candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+// RequestVote RPC response
+message RequestVoteResponse {
+  uint64 current_term = 1;
+  bool vote_granted = 2;
+}
+
+// Log entry
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  bytes event = 3;
+}
