@@ -95,6 +95,8 @@ func (n *Node) UpdateTerm(term uint64) bool {
 
 	if term > n.currentTerm {
 		n.currentTerm = term
+		n.voteTo = uuid.Nil
+		n.leaderID = uuid.Nil
 		return true
 	}
 	return false
@@ -154,7 +156,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	return n.role.HandleAppendEntries(ctx, req)
 }
 
-func (n *Node) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	return n.role.HandleRequestVote(ctx, req)
 }
 
@@ -165,6 +167,7 @@ func (n *Node) StepDown(oldRole Role, newRole RoleName) {
 	if oldRole != nil {
 		if err := oldRole.OnExit(); err != nil {
 			log.Printf("[Node %s] previous role failed to exit: %s", n.ID.String(), err)
+			return
 		}
 	}
 

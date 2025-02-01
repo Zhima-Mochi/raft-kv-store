@@ -8,8 +8,8 @@ import (
 
 // Constants for timeouts/intervals
 const (
-	ElectionTimeoutMin = 1 * time.Second
-	ElectionTimeoutMax = 3 * time.Second
+	ElectionTimeoutMin = 10 * time.Second
+	ElectionTimeoutMax = 30 * time.Second
 )
 
 type Vote struct {

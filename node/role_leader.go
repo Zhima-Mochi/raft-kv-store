@@ -115,6 +115,9 @@ func (ls *LeaderRole) sendHeartbeats(ctx context.Context) {
 
 	for _, peer := range ls.node.GetPeers() {
 		go func(peer Peer) {
+			ctx, cancel := context.WithTimeout(ctx, LeaderHeartbeatTimeout)
+			defer cancel()
+
 			resp, err := peer.AppendEntries(ctx, &pb.AppendEntriesRequest{
 				Term:     ls.node.currentTerm,
 				LeaderId: &pb.UUID{Value: ls.node.ID.String()},
@@ -126,6 +129,7 @@ func (ls *LeaderRole) sendHeartbeats(ctx context.Context) {
 
 			if resp.CurrentTerm > ls.node.currentTerm {
 				log.WithField("received_term", resp.CurrentTerm).Info("Received higher term in heartbeat response, stepping down")
+				ls.node.UpdateTerm(resp.CurrentTerm)
 				ls.node.StepDown(ls, RoleNameFollower)
 			}
 		}(peer)

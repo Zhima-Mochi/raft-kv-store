@@ -47,10 +47,9 @@ func (cr *CandidateRole) Enter(ctx context.Context) error {
 	cr.cancel = cancel
 
 	// Increment current term and vote for self
-	cr.node.termMutex.Lock()
-	cr.node.currentTerm++
+	term := cr.node.GetTerm()
+	cr.node.UpdateTerm(term + 1)
 	cr.node.voteTo = cr.node.ID
-	cr.node.termMutex.Unlock()
 
 	// Start election
 	cr.startElection(ctx)
@@ -93,6 +92,7 @@ func (cr *CandidateRole) OnExit() error {
 func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	// If we receive an AppendEntries RPC from new leader with higher term
 	if req.Term > cr.node.currentTerm {
+		cr.node.UpdateTerm(req.Term)
 		cr.node.StepDown(cr, RoleNameFollower)
 		return &pb.AppendEntriesResponse{
 			CurrentTerm: req.Term,
@@ -107,19 +107,38 @@ func (cr *CandidateRole) HandleAppendEntries(ctx context.Context, req *pb.Append
 }
 
 func (cr *CandidateRole) HandleRequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	// If we receive a RequestVote RPC with higher term
-	if req.Term > cr.node.currentTerm {
-		cr.node.StepDown(cr, RoleNameFollower)
+	log := cr.node.GetLoggerEntry().WithFields(map[string]interface{}{
+		"candidate_id": req.CandidateId.Value,
+	})
+
+	// Reply false if term < currentTerm
+	if req.Term < cr.node.currentTerm {
+		log.WithField("received_term", req.Term).Info("Rejecting vote request due to lower term")
 		return &pb.RequestVoteResponse{
-			CurrentTerm: req.Term,
+			CurrentTerm: cr.node.currentTerm,
 			VoteGranted: false,
 		}, nil
 	}
 
-	return &pb.RequestVoteResponse{
-		CurrentTerm: cr.node.currentTerm,
-		VoteGranted: false,
-	}, nil
+	// As a candidate, we've already voted for ourselves in the current term
+	// So we should reject all other vote requests in our term
+	if req.Term == cr.node.currentTerm {
+		log.Info("Rejecting vote request, already voted for self in current term")
+		return &pb.RequestVoteResponse{
+			CurrentTerm: cr.node.currentTerm,
+			VoteGranted: false,
+		}, nil
+	}
+
+	// If we receive a RequestVote RPC with higher term
+
+	log.WithField("received_term", req.Term).Info("Received higher term, updating term")
+	cr.node.UpdateTerm(req.Term)
+	// Step down to follower since we discovered a higher term
+	cr.node.StepDown(cr, RoleNameFollower)
+
+	// Continue with vote handling as a follower would
+	return cr.node.RequestVote(ctx, req)
 }
 
 func (cr *CandidateRole) startElection(ctx context.Context) {

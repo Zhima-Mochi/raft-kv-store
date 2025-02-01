@@ -43,7 +43,7 @@ func (fr *FollowerRole) Enter(ctx context.Context) error {
 	fr.cancel = cancel
 
 	// Start election timer
-	ticker := time.NewTicker(ElectionTimeoutMin + time.Duration(fr.rand.Float64()*float64(ElectionTimeoutMax-ElectionTimeoutMin)))
+	ticker := time.NewTicker(LeaderHeartbeatTimeout)
 
 	go func() {
 		defer ticker.Stop()
@@ -54,7 +54,7 @@ func (fr *FollowerRole) Enter(ctx context.Context) error {
 			case <-ticker.C:
 				// If we haven't received any AppendEntries from leader
 				if !fr.isEnd.Load() {
-					log.Info("Election timeout, converting to candidate")
+					log.Warn("Leader heartbeat timeout, converting to candidate")
 					fr.node.StepDown(fr, RoleNameCandidate)
 					return
 				}
@@ -125,8 +125,7 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *pb.RequestVo
 
 	// Update term if needed
 	if req.Term > fr.node.currentTerm {
-		fr.node.currentTerm = req.Term
-		fr.node.voteTo = uuid.Nil
+		fr.node.UpdateTerm(req.Term)
 		log.WithField("new_term", req.Term).Info("Updated term from RequestVote")
 	}
 
@@ -145,23 +144,4 @@ func (fr *FollowerRole) HandleRequestVote(ctx context.Context, req *pb.RequestVo
 		CurrentTerm: fr.node.currentTerm,
 		VoteGranted: false,
 	}, nil
-}
-
-func (fr *FollowerRole) resetElectionTimer() {
-	// Random timeout between ElectionTimeoutMin and ElectionTimeoutMax
-	timeout := ElectionTimeoutMin + time.Duration(fr.rand.Float64()*float64(ElectionTimeoutMax-ElectionTimeoutMin))
-
-	time.AfterFunc(timeout, func() {
-		if fr.node.role.Name() == RoleNameFollower.String() {
-			fr.node.StepDown(fr, RoleNameCandidate)
-		}
-	})
-}
-
-func (fr *FollowerRole) checkLeaderAlive(ctx context.Context) bool {
-	leader, ok := fr.node.GetPeer(fr.node.leaderID)
-	if !ok {
-		return false
-	}
-	return time.Since(leader.GetLastHeartbeat()) <= LeaderHeartbeatTimeout
 }
